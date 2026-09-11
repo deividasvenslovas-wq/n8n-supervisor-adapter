@@ -24,6 +24,13 @@
 //   SUPERVISOR_WORKFLOW_ID   the n8n workflow id of the Supervisor Loop workflow
 //                            (falls back to 'a0maIdHvdCHvunBY' if unset — set this
 //                            explicitly if your Supervisor workflow id differs)
+//
+// Optional (used by patch_node_parameter's write step; recommended for
+// least-privilege — keeps N8N_API_KEY permanently read-only):
+//   N8N_API_WRITE_KEY   a separate n8n API key scoped to only
+//                       workflow:create/list/read/update (no delete, no
+//                       activate/deactivate, no executions/credentials).
+//                       If unset, N8N_API_KEY is used for writes too.
 
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -36,6 +43,7 @@ const {
   SUPERVISOR_AUTH_HEADER_VALUE,
   N8N_API_BASE_URL,
   N8N_API_KEY,
+  N8N_API_WRITE_KEY,
   SUPERVISOR_WORKFLOW_ID = "a0maIdHvdCHvunBY",
   PORT = 3000,
 } = process.env;
@@ -80,10 +88,14 @@ async function n8nApiGet(path) {
 
 async function n8nApiPut(path, body) {
   const url = `${N8N_API_BASE_URL.replace(/\/$/, "")}${path}`;
+  // Prefer a dedicated write-scoped key (workflow:update etc.) so the
+  // read-only N8N_API_KEY's permissions never need to grow. Falls back to
+  // N8N_API_KEY if no separate write key is configured.
+  const writeKey = N8N_API_WRITE_KEY || N8N_API_KEY;
   const resp = await fetch(url, {
     method: "PUT",
     headers: {
-      "X-N8N-API-KEY": N8N_API_KEY,
+      "X-N8N-API-KEY": writeKey,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
