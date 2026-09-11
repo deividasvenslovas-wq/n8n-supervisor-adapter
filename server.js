@@ -467,7 +467,17 @@ function buildServer() {
           if (!node.parameters) node.parameters = {};
           setByPath(node.parameters, parameter_path, new_value);
 
-          await n8nApiPut(`/workflows/${encodeURIComponent(workflow_id)}`, workflow);
+          // n8n's PUT /workflows/{id} endpoint has a strict schema and
+          // rejects extra read-only fields (createdAt, versionId,
+          // activeVersion, shared, etc.) that GET returns. Send only the
+          // minimal accepted set, mutated in place above.
+          const minimalPayload = {
+            name: workflow.name,
+            nodes: workflow.nodes,
+            connections: workflow.connections,
+            settings: workflow.settings || {},
+          };
+          await n8nApiPut(`/workflows/${encodeURIComponent(workflow_id)}`, minimalPayload);
 
           const verifyText = await n8nApiGet(`/workflows/${encodeURIComponent(workflow_id)}`);
           const verifyWorkflow = JSON.parse(verifyText);
