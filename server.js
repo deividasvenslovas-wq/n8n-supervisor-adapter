@@ -1,6 +1,11 @@
 // n8n Supervisor MCP Adapter
 // Exposes:
-//  - send_supervisor_command: forwards a command to your n8n Supervisor webhook
+//  - send_supervisor_command: forwards a command to your n8n Supervisor webhook.
+//    If the initial POST times out or returns HTTP 524 (Cloudflare/n8n.cloud
+//    gateway timeout — happens when the Supervisor loop takes longer than
+//    ~100s to finish), this automatically falls back to polling the n8n API
+//    for the matching execution until it finishes, then extracts and returns
+//    the real final result instead of just surfacing the 524 error.
 //  - READ-ONLY n8n API tools: list_workflows, get_workflow, list_executions,
 //    get_execution — these only ever call GET on the n8n REST API.
 //  - patch_node_parameter: a SCOPED write tool — changes exactly one
@@ -12,8 +17,13 @@
 //   SUPERVISOR_AUTH_HEADER_NAME   e.g. "Authorization" or your custom header name
 //   SUPERVISOR_AUTH_HEADER_VALUE  the secret value for that header (the "ChatGPT Bridge Auth" key)
 //   N8N_API_BASE_URL   e.g. https://your-n8n-host/api/v1
-//   N8N_API_KEY        your n8n API key (read-only scope), used for list_workflows/get_workflow/list_executions/get_execution
+//   N8N_API_KEY        your n8n API key (read-only scope)
 //   PORT (optional, defaults to 3000)
+//
+// Optional (enables the 524 polling fallback for send_supervisor_command):
+//   SUPERVISOR_WORKFLOW_ID   the n8n workflow id of the Supervisor Loop workflow
+//                            (falls back to 'a0maIdHvdCHvunBY' if unset — set this
+//                            explicitly if your Supervisor workflow id differs)
 
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -26,6 +36,7 @@ const {
   SUPERVISOR_AUTH_HEADER_VALUE,
   N8N_API_BASE_URL,
   N8N_API_KEY,
+  SUPERVISOR_WORKFLOW_ID = "a0maIdHvdCHvunBY",
   PORT = 3000,
 } = process.env;
 
@@ -36,11 +47,20 @@ if (!SUPERVISOR_WEBHOOK_URL || !SUPERVISOR_AUTH_HEADER_NAME || !SUPERVISOR_AUTH_
   process.exit(1);
 }
 
-// n8n API tools are optional — only registered if these are set.
+// n8n API tools (and the 524 polling fallback) are optional — only enabled if these are set.
 const N8N_API_ENABLED = Boolean(N8N_API_BASE_URL && N8N_API_KEY);
 
 // Max characters of an execution's "data" payload to return before truncating.
 const MAX_EXECUTION_DATA_CHARS = 15000;
+
+// How long to wait for the initial synchronous POST before treating it as
+// "gateway will time out anyway" and switching to polling. Kept a little
+// under Cloudflare's ~100s limit so we control the cutover ourselves.
+const INITIAL_REQUEST_TIMEOUT_MS = 90000;
+
+// Polling fallback tuning.
+const POLL_INTERVAL_MS = 8000;
+const POLL_MAX_ATTEMPTS = 30; // ~4 minutes total
 
 async function n8nApiGet(path) {
   const url = `${N8N_API_BASE_URL.replace(/\/$/, "")}${path}`;
@@ -90,6 +110,96 @@ function setByPath(obj, path, value) {
   target[last] = value;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Given a finished Supervisor Loop execution's full data, pull out the
+// human-readable final answer the same way the workflow's own
+// "Return Final Result" / "Build Loop Limit Response" nodes would.
+function extractFinalOutputFromExecution(execJson) {
+  const runData = execJson?.resultData?.runData;
+  if (!runData) return null;
+
+  // Loop-limit-reached path.
+  const loopLimitRuns = runData["Build Loop Limit Response"];
+  if (Array.isArray(loopLimitRuns) && loopLimitRuns.length > 0) {
+    const last = loopLimitRuns[loopLimitRuns.length - 1];
+    const val = last?.data?.main?.[0]?.[0]?.json?.status;
+    if (val) return String(val);
+  }
+
+  // Normal path: last "Supervisor Review" run should carry the final
+  // "DONE: ..." text (the workflow strips the "DONE:" prefix itself).
+  const reviewRuns = runData["Supervisor Review"];
+  if (Array.isArray(reviewRuns) && reviewRuns.length > 0) {
+    const last = reviewRuns[reviewRuns.length - 1];
+    const output = last?.data?.main?.[0]?.[0]?.json?.output;
+    if (typeof output === "string") {
+      if (/^DONE:\s*/i.test(output)) {
+        return output.replace(/^DONE:\s*/i, "");
+      }
+      return `${output}\n\n(Note: execution finished but the last recorded step was still CONTINUE — this may be an incomplete result.)`;
+    }
+  }
+
+  return null;
+}
+
+async function pollForSupervisorResult(commandSentAt) {
+  for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
+    await sleep(POLL_INTERVAL_MS);
+
+    let listText;
+    try {
+      listText = await n8nApiGet(`/executions?workflowId=${encodeURIComponent(SUPERVISOR_WORKFLOW_ID)}&limit=1`);
+    } catch (err) {
+      continue; // transient — just try again next tick
+    }
+
+    let list;
+    try {
+      list = JSON.parse(listText);
+    } catch {
+      continue;
+    }
+
+    const latest = (list?.data || [])[0];
+    if (!latest) continue;
+
+    // Make sure this execution actually started at/after our command,
+    // not a stale prior run.
+    const startedAt = latest.startedAt ? new Date(latest.startedAt).getTime() : 0;
+    if (startedAt < commandSentAt - 5000) continue; // too old, not our run yet
+
+    if (!latest.finished) continue; // still running, keep polling
+
+    let fullText;
+    try {
+      fullText = await n8nApiGet(`/executions/${encodeURIComponent(latest.id)}?includeData=true`);
+    } catch (err) {
+      return { error: `Execution ${latest.id} finished but re-fetching full data failed: ${err.message}` };
+    }
+
+    let fullJson;
+    try {
+      fullJson = JSON.parse(fullText);
+    } catch {
+      return { error: `Execution ${latest.id} finished but its data could not be parsed.` };
+    }
+
+    const finalOutput = extractFinalOutputFromExecution(fullJson.data || fullJson);
+
+    return {
+      executionId: latest.id,
+      status: latest.status,
+      finalOutput: finalOutput || "(Execution finished but no recognizable final output field was found — inspect with get_execution.)",
+    };
+  }
+
+  return { error: `Gave up polling after ${POLL_MAX_ATTEMPTS} attempts (~${Math.round((POLL_MAX_ATTEMPTS * POLL_INTERVAL_MS) / 1000)}s). The Supervisor run may still be in progress — check with list_executions/get_execution.` };
+}
+
 function buildServer() {
   const server = new McpServer({
     name: "n8n-supervisor-adapter",
@@ -101,45 +211,87 @@ function buildServer() {
     {
       title: "Send command to n8n Supervisor",
       description:
-        "Sends a single text command to the n8n Supervisor workflow and returns its response. Use this whenever the user asks you to run, check, or relay a command to their n8n Supervisor (e.g. 'STATUS').",
+        "Sends a single text command to the n8n Supervisor workflow and returns its response. Use this whenever the user asks you to run, check, or relay a command to their n8n Supervisor (e.g. 'STATUS', or a diagnostic/fix command). If the run takes longer than ~90s and the gateway times out (HTTP 524), this automatically falls back to polling for the result instead of just failing.",
       inputSchema: {
         command: z.string().describe("The command text to send to the Supervisor, e.g. 'STATUS'"),
       },
     },
     async ({ command }) => {
+      const sentAt = Date.now();
+
+      let resp;
+      let timedOutLocally = false;
       try {
-        const resp = await fetch(SUPERVISOR_WEBHOOK_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            [SUPERVISOR_AUTH_HEADER_NAME]: SUPERVISOR_AUTH_HEADER_VALUE,
-          },
-          body: JSON.stringify({ command }),
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          timedOutLocally = true;
+          controller.abort();
+        }, INITIAL_REQUEST_TIMEOUT_MS);
 
-        const text = await resp.text();
-
-        if (!resp.ok) {
+        try {
+          resp = await fetch(SUPERVISOR_WEBHOOK_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              [SUPERVISOR_AUTH_HEADER_NAME]: SUPERVISOR_AUTH_HEADER_VALUE,
+            },
+            body: JSON.stringify({ command }),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch (err) {
+        if (!timedOutLocally) {
           return {
-            content: [
-              {
-                type: "text",
-                text: `Supervisor returned HTTP ${resp.status}: ${text}`,
-              },
-            ],
+            content: [{ type: "text", text: `Failed to reach Supervisor: ${err.message}` }],
             isError: true,
           };
         }
+        resp = null;
+      }
 
+      const gatewayTimedOut = resp && resp.status === 524;
+
+      if (resp && resp.ok) {
+        const text = await resp.text();
+        return { content: [{ type: "text", text }] };
+      }
+
+      if (resp && !resp.ok && !gatewayTimedOut) {
+        const text = await resp.text();
         return {
-          content: [{ type: "text", text }],
-        };
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Failed to reach Supervisor: ${err.message}` }],
+          content: [{ type: "text", text: `Supervisor returned HTTP ${resp.status}: ${text}` }],
           isError: true,
         };
       }
+
+      if (!N8N_API_ENABLED) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Supervisor request timed out (gateway 524) and the polling fallback is disabled (N8N_API_BASE_URL/N8N_API_KEY not set). The n8n execution may still complete in the background — check manually in n8n.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const result = await pollForSupervisorResult(sentAt);
+
+      if (result.error) {
+        return { content: [{ type: "text", text: `Gateway timed out, then polling failed: ${result.error}` }], isError: true };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `[Note: initial request hit a gateway timeout; result recovered via polling. Execution ${result.executionId}, status: ${result.status}]\n\n${result.finalOutput}`,
+          },
+        ],
+      };
     }
   );
 
@@ -254,7 +406,7 @@ function buildServer() {
           "Changes ONE parameter on ONE node inside a workflow. Defaults to dry_run=true, which returns the current value, the proposed new value, and a diff WITHOUT writing anything. Only pass dry_run:false after reviewing the dry-run output — this then writes the change and re-fetches the workflow to verify the new value actually landed live.",
         inputSchema: {
           workflow_id: z.string().describe("The n8n workflow id, e.g. '35inTs8bss3QeHVo'"),
-          node_id: z.string().describe("The node's id (not its display name), e.g. 'a956e6a1'"),
+          node_id: z.string().describe("The node's id (not its display name), e.g. 'a956e6a1-ff86-4362-befb-ab04c4efc8d0'"),
           parameter_path: z
             .string()
             .describe("Dot path inside node.parameters to change, e.g. 'url' or 'options.timeout'"),
@@ -270,7 +422,6 @@ function buildServer() {
       },
       async ({ workflow_id, node_id, parameter_path, new_value, dry_run = true }) => {
         try {
-          // 1. Fresh read — never operate on stale/cached workflow data.
           const currentText = await n8nApiGet(`/workflows/${encodeURIComponent(workflow_id)}`);
           const workflow = JSON.parse(currentText);
 
@@ -313,14 +464,11 @@ function buildServer() {
             };
           }
 
-          // 2. Apply the single-field change to a full in-memory copy.
           if (!node.parameters) node.parameters = {};
           setByPath(node.parameters, parameter_path, new_value);
 
-          // 3. Write the whole workflow back.
           await n8nApiPut(`/workflows/${encodeURIComponent(workflow_id)}`, workflow);
 
-          // 4. LIVE VERIFY — re-fetch fresh, don't trust the PUT response alone.
           const verifyText = await n8nApiGet(`/workflows/${encodeURIComponent(workflow_id)}`);
           const verifyWorkflow = JSON.parse(verifyText);
           const verifyNode = (verifyWorkflow.nodes || []).find((n) => n.id === node_id);
@@ -367,8 +515,6 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-// Stateless mode: a fresh server+transport per request is simplest and
-// avoids session-management complexity for a single-tool adapter.
 app.post("/mcp", async (req, res) => {
   const server = buildServer();
   const transport = new StreamableHTTPServerTransport({
@@ -395,7 +541,6 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// GET/DELETE on /mcp are not needed in stateless mode
 app.get("/mcp", (_req, res) => res.status(405).send("Method Not Allowed"));
 app.delete("/mcp", (_req, res) => res.status(405).send("Method Not Allowed"));
 
