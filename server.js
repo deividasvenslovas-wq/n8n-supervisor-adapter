@@ -39,6 +39,11 @@ if (!SUPERVISOR_WEBHOOK_URL || !SUPERVISOR_AUTH_HEADER_NAME || !SUPERVISOR_AUTH_
 // n8n API tools are optional — only registered if these are set.
 const N8N_API_ENABLED = Boolean(N8N_API_BASE_URL && N8N_API_KEY);
 
+// Max characters of an execution's "data" payload to return before truncating.
+// Full execution data can run into the tens of thousands of tokens and blow
+// out the AI's context window, so anything larger gets cut down to a preview.
+const MAX_EXECUTION_DATA_CHARS = 15000;
+
 async function n8nApiGet(path) {
   const url = `${N8N_API_BASE_URL.replace(/\/$/, "")}${path}`;
   const resp = await fetch(url, {
@@ -177,15 +182,35 @@ function buildServer() {
       {
         title: "Get n8n execution detail (read-only)",
         description:
-          "Fetches full detail of one execution by id, including per-node input/output data — useful for diagnosing why a run failed or behaved unexpectedly. Read-only.",
+          "Fetches full detail of one execution by id, including per-node input/output data — useful for diagnosing why a run failed or behaved unexpectedly. Read-only. Large execution payloads are automatically truncated to a preview to avoid overflowing context.",
         inputSchema: {
           execution_id: z.string().describe("The n8n execution id"),
         },
       },
       async ({ execution_id }) => {
         try {
-          const text = await n8nApiGet(`/executions/${encodeURIComponent(execution_id)}?includeData=true`);
-          return { content: [{ type: "text", text }] };
+          const text = await n8nApiGet(
+            `/executions/${encodeURIComponent(execution_id)}?includeData=true`
+          );
+
+          let payload = text;
+          try {
+            const json = JSON.parse(text);
+            const dataStr = JSON.stringify(json.data ?? {});
+            if (dataStr.length > MAX_EXECUTION_DATA_CHARS) {
+              json.data = {
+                truncated: true,
+                note: `Execution data was ${dataStr.length} chars and has been truncated to a ${MAX_EXECUTION_DATA_CHARS}-char preview to avoid overflowing context. Ask about a specific node by name for more targeted detail if this endpoint is extended later.`,
+                preview: dataStr.slice(0, MAX_EXECUTION_DATA_CHARS),
+              };
+            }
+            payload = JSON.stringify(json);
+          } catch (parseErr) {
+            // Response wasn't valid JSON (unexpected for a successful n8n API
+            // call) — fall back to returning the raw text untouched.
+          }
+
+          return { content: [{ type: "text", text: payload }] };
         } catch (err) {
           return { content: [{ type: "text", text: err.message }], isError: true };
         }
