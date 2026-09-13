@@ -11,6 +11,10 @@
 //  - patch_node_parameter: a SCOPED write tool — changes exactly one
 //    parameter on one existing node, dry-run by default, with a live
 //    post-write verification read.
+//  - creatomate_renders: READ-ONLY Creatomate render log. Without a
+//    render_id it lists recent renders (id, status, error_message); with a
+//    render_id it returns that render in full, including the composition
+//    source that was submitted. Only ever calls GET.
 //
 // Required environment variables (set these on your host, NEVER in code):
 //   SUPERVISOR_WEBHOOK_URL   e.g. https://your-n8n-host/webhook/openai-supervisor-loop
@@ -31,6 +35,10 @@
 //                       workflow:create/list/read/update (no delete, no
 //                       activate/deactivate, no executions/credentials).
 //                       If unset, N8N_API_KEY is used for writes too.
+//
+// Optional (enables the creatomate_renders tool):
+//   CREATOMATE_API_KEY  your Creatomate API key. Read-only usage: the tool
+//                       only ever issues GET /v1/renders requests.
 
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
@@ -44,6 +52,7 @@ const {
   N8N_API_BASE_URL,
   N8N_API_KEY,
   N8N_API_WRITE_KEY,
+  CREATOMATE_API_KEY,
   SUPERVISOR_WORKFLOW_ID = "a0maIdHvdCHvunBY",
   PORT = 3000,
 } = process.env;
@@ -57,6 +66,13 @@ if (!SUPERVISOR_WEBHOOK_URL || !SUPERVISOR_AUTH_HEADER_NAME || !SUPERVISOR_AUTH_
 
 // n8n API tools (and the 524 polling fallback) are optional — only enabled if these are set.
 const N8N_API_ENABLED = Boolean(N8N_API_BASE_URL && N8N_API_KEY);
+
+// Creatomate render-log tool is optional — only enabled if the key is set.
+const CREATOMATE_ENABLED = Boolean(CREATOMATE_API_KEY);
+const CREATOMATE_API_BASE_URL = "https://api.creatomate.com/v1";
+
+// Max characters of a single Creatomate render payload to return before truncating.
+const MAX_CREATOMATE_RENDER_CHARS = 20000;
 
 // Max characters of an execution's "data" payload to return before truncating.
 const MAX_EXECUTION_DATA_CHARS = 15000;
@@ -103,6 +119,24 @@ async function n8nApiPut(path, body) {
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`n8n API PUT ${path} returned HTTP ${resp.status}: ${text}`);
+  }
+  return text;
+}
+
+// Read-only Creatomate GET. Never used for POST/PUT/DELETE — this adapter
+// cannot start or cancel renders, only inspect them.
+async function creatomateApiGet(path) {
+  const url = `${CREATOMATE_API_BASE_URL}${path}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${CREATOMATE_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+  });
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Creatomate API GET ${path} returned HTTP ${resp.status}: ${text}`);
   }
   return text;
 }
@@ -306,6 +340,62 @@ function buildServer() {
       };
     }
   );
+
+  if (CREATOMATE_ENABLED) {
+    server.registerTool(
+      "creatomate_renders",
+      {
+        title: "Creatomate render log (read-only)",
+        description:
+          "Read-only view of the Creatomate render log. Without render_id: lists the most recent renders with id, status, error_message and output url — use this to see why a render failed. With render_id: returns that single render in full, including the composition source that was submitted. Only ever issues GET requests; cannot start, modify or cancel renders.",
+        inputSchema: {
+          render_id: z
+            .string()
+            .optional()
+            .describe("Optional: a specific Creatomate render id, e.g. '150b3c58-c895-438d-9bc3-416737b5151c'. Omit to list recent renders."),
+          limit: z
+            .number()
+            .optional()
+            .describe("Optional: how many recent renders to list (1-20, default 5). Ignored when render_id is given."),
+        },
+      },
+      async ({ render_id, limit }) => {
+        try {
+          if (render_id) {
+            const text = await creatomateApiGet(`/renders/${encodeURIComponent(render_id)}`);
+            const payload =
+              text.length > MAX_CREATOMATE_RENDER_CHARS
+                ? `${text.slice(0, MAX_CREATOMATE_RENDER_CHARS)}\n\n[truncated: render payload was ${text.length} chars]`
+                : text;
+            return { content: [{ type: "text", text: payload }] };
+          }
+
+          const n = Math.min(Math.max(Number(limit) || 5, 1), 20);
+          const text = await creatomateApiGet(`/renders?limit=${n}`);
+
+          let payload = text;
+          try {
+            const parsed = JSON.parse(text);
+            const list = Array.isArray(parsed) ? parsed : parsed?.data || [];
+            const slim = list.slice(0, n).map((r) => ({
+              id: r.id,
+              status: r.status,
+              error_message: r.error_message || null,
+              created_at: r.created_at || null,
+              url: r.url || null,
+            }));
+            payload = JSON.stringify({ count: slim.length, renders: slim }, null, 2);
+          } catch (parseErr) {
+            // Response wasn't valid JSON — fall back to raw text.
+          }
+
+          return { content: [{ type: "text", text: payload }] };
+        } catch (err) {
+          return { content: [{ type: "text", text: err.message }], isError: true };
+        }
+      }
+    );
+  }
 
   if (N8N_API_ENABLED) {
     server.registerTool(
